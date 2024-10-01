@@ -1,0 +1,199 @@
+#include <ESP32Servo.h>
+#include <MPU6050.h>
+
+// Initialize the MPU-6050 object
+MPU6050 mpu;
+
+// Define the Servo objects for tilting propellers and base
+Servo servobase, servotilt, servobaseb, servotiltb;
+// Define ESC objects for controlling propeller speeds
+Servo esc1, esc2;
+
+// PID gains for roll, pitch, and yaw stabilization
+float kp = 2.0;
+float ki = 0.5;
+float kd = 1.0;
+
+// Desired orientation (setpoint) for stabilization
+float desiredRoll = 0.0;
+float desiredPitch = 0.0;
+float desiredYaw = 0.0;
+
+// MPU6050 sensor data variables
+int16_t ax, ay, az;
+int16_t gx, gy, gz;
+float roll, pitch, yaw;
+
+// VTOL mode switch variable
+bool vtolMode = false;
+
+// RC (Remote Control) input pins for controlling the UAV
+#define RCPintilt 32  // Pin for the up/down stick
+#define RCPinbase 35  // Pin for the left/right stick
+#define switchc 33    // Switch to toggle between VTOL and normal mode
+#define switchd 25    // Additional switch for custom functions
+#define ch3 34        // Throttle input from receiver
+
+// Servo pin assignments for controlling tilt and base
+int servoPinbase = 13;  // Front base
+int servoPintilt = 14;  // Front tilt
+int servoPinbaseb = 27; // Back base
+int servoPintiltb = 26; // Back tilt
+
+// ESC pin assignments
+byte esc1pin = 18; // ESC 1 (propeller 1)
+byte esc2pin = 19; // ESC 2 (propeller 2)
+
+// RC input range values (adjust based on transmitter/receiver calibration)
+long maxup = 1960, maxmidup = 1550, minmiddown = 1460, mindown = 930;
+long maxleft = 990, maxmidleft = 1460, maxmidright = 1530, maxright = 1940;
+
+// Define variables for storing RC input values
+int throttle = 0, switchdValue = 0, RCValuebase = 0, RCValuetilt = 0, switchcValue = 0;
+
+// PID cumulative error and previous error for derivative calculation
+float cumulativeErrorRoll = 0, cumulativeErrorPitch = 0, cumulativeErrorYaw = 0;
+float previousErrorRoll = 0, previousErrorPitch = 0, previousErrorYaw = 0;
+
+void setup() {
+  // Initialize serial communication for debugging
+  Serial.begin(9600);
+
+  // Initialize the MPU-6050 sensor
+  mpu.initialize();
+
+  // Attach servos and ESCs to their respective pins
+  servobase.attach(servoPinbase);
+  servotilt.attach(servoPintilt);
+  servobaseb.attach(servoPinbaseb);
+  servotiltb.attach(servoPintiltb);
+  esc1.attach(esc1pin);
+  esc2.attach(esc2pin);
+
+  // Initialize the ESCs to a safe state (idle throttle)
+  esc1.writeMicroseconds(1300);
+  esc2.writeMicroseconds(1300);
+  delay(7000); // Allow time for the ESCs to calibrate
+
+  // Configure the RC input pins
+  pinMode(ch3, INPUT);
+  pinMode(switchd, INPUT);
+  pinMode(RCPintilt, INPUT);
+  pinMode(RCPinbase, INPUT);
+  pinMode(switchc, INPUT);
+}
+
+void loop() {
+  // Read RC input values (throttle, switch, and joystick)
+  throttle = pulseIn(ch3, HIGH);
+  switchdValue = pulseIn(switchd, HIGH);
+  RCValuebase = pulseIn(RCPinbase, HIGH);
+  RCValuetilt = pulseIn(RCPintilt, HIGH);
+  switchcValue = pulseIn(switchc, HIGH);
+
+  // Read the MPU-6050 sensor data for roll, pitch, and yaw calculations
+  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+  roll = atan2(ay, az) * 180 / PI;
+  pitch = atan2(ax, az) * 180 / PI;
+  yaw = atan2(gy, gx) * 180 / PI;
+
+  // Calculate errors between desired and actual orientation
+  float errorRoll = desiredRoll - roll;
+  float errorPitch = desiredPitch - pitch;
+  float errorYaw = desiredYaw - yaw;
+
+  // Accumulate the integral of errors for the PID controller
+  cumulativeErrorRoll += errorRoll;
+  cumulativeErrorPitch += errorPitch;
+  cumulativeErrorYaw += errorYaw;
+
+  // PID calculation for roll, pitch, and yaw control
+  float pidRoll = kp * errorRoll + ki * cumulativeErrorRoll + kd * (errorRoll - previousErrorRoll);
+  float pidPitch = kp * errorPitch + ki * cumulativeErrorPitch + kd * (errorPitch - previousErrorPitch);
+  float pidYaw = kp * errorYaw + ki * cumulativeErrorYaw + kd * (errorYaw - previousErrorYaw);
+
+  // Store current error values for the next iteration's derivative calculation
+  previousErrorRoll = errorRoll;
+  previousErrorPitch = errorPitch;
+  previousErrorYaw = errorYaw;
+
+  // Update the servo positions based on the PID output
+  // Front and back tilt and base adjustment for stabilization
+  servobase.write(60 + pidRoll);        // Adjust front base
+  servotilt.write(80 + pidPitch);       // Adjust front tilt
+  servobaseb.write(180 - pidRoll);      // Adjust back base
+  servotiltb.write(90 - pidPitch);      // Adjust back tilt
+
+  // Throttle control (motor speed adjustment) based on the RC input
+  int esc1pwm = map(throttle, 980, 2000, 1000, 1600);
+  int esc2pwm = map(throttle, 980, 2000, 1000, 1600);
+  esc1.writeMicroseconds(esc1pwm);
+  esc2.writeMicroseconds(esc2pwm);
+
+  // VTOL mode switch logic
+  if (switchcValue > 1450 && switchcValue < 1530) {
+    vtolMode = true;
+  } else {
+    vtolMode = false;
+  }
+
+  // VTOL mode handling
+  if (vtolMode) {
+    // Adjust servos and motors for vertical takeoff and landing (VTOL)
+    if (switchdValue > 1940 && switchdValue < 2100) {
+      esc1pwm = map(throttle, 980, 2000, 1000, 2000);
+      esc2pwm = map(throttle, 980, 2000, 1000, 1500);
+      esc1.writeMicroseconds(esc1pwm);
+      esc2.writeMicroseconds(esc2pwm);
+
+      servobase.write(60);   // Set base servos to a neutral position for VTOL
+      servotilt.write(170);  // Tilt motors to provide vertical lift
+
+      // Adjust back servos based on left/right stick input for directional control
+      if (RCValuebase < maxmidleft) {
+        int posleftb = map(RCValuebase, maxmidleft, maxleft, 90, 70);
+        servobaseb.write(posleftb);
+        servotiltb.write(0);
+      } else if (RCValuebase > maxmidright) {
+        int posrightb = map(RCValuebase, maxmidright, maxright, 90, 110);
+        servobaseb.write(posrightb);
+        servotiltb.write(0);
+      } else {
+        servobaseb.write(90);
+        servotiltb.write(0);
+      }
+    }
+  } else {
+    // Normal flight mode handling
+    if (switchdValue > 1940 && switchdValue < 2100) {
+      esc1pwm = map(throttle, 980, 2000, 1000, 1600);
+      esc2pwm = map(throttle, 980, 2000, 1000, 1600);
+      esc1.writeMicroseconds(esc1pwm);
+      esc2.writeMicroseconds(esc2pwm);
+
+      // Adjust servos based on the tilt (up/down) stick input
+      if (RCValuetilt > maxmidup) {
+        servobase.write(60);
+        int posup = map(RCValuetilt, maxmidup, maxup, 80, 130);
+        servotilt.write(posup);
+        servobaseb.write(180);
+        servotiltb.write(90);
+      } else if (RCValuetilt >= minmiddown && RCValuetilt <= maxmidup) {
+        servobase.write(60);
+        servotilt.write(80);
+        servobaseb.write(180);
+        servotiltb.write(90);
+
+        // Adjust back servos based on left/right stick input
+        if (RCValuebase < maxmidleft) {
+          int posleftb = map(RCValuebase, maxmidleft, maxleft, 90, 130);
+          servotiltb.write(posleftb);
+        } else if (RCValuebase > maxmidright) {
+          int posrightb = map(RCValuebase, maxmidright, maxright, 90, 50);
+          servotiltb.write(posrightb);
+        }
+      }
+    }
+  }
+  delay(50); // Small delay for stability in loop
+}
