@@ -1,0 +1,173 @@
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+#include <MPU6050.h>
+#include <Servo.h>
+
+// PCA9685 channels for servos
+#define FRONT_BASE_CHANNEL 0
+#define FRONT_TILT_CHANNEL 1
+#define BACK_BASE_CHANNEL 2
+#define BACK_TILT_CHANNEL 3
+
+// ESC control pins
+const int ESC_LEFT_PIN = 9;
+const int ESC_RIGHT_PIN = 10;
+
+// RC input pins
+const int RC_PIN_TILT = 8;  
+const int RC_PIN_BASE = 7;  
+const int RC_PIN_THROTTLE = 6;  
+const int RC_PIN_YAW = 5;  // Added for yaw control
+
+// PWM range for PCA9685
+#define SERVOMIN 150
+#define SERVOMAX 600
+
+// MPU6050 and PCA9685 objects
+MPU6050 mpu;
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
+
+// PID constants for stabilization
+const float KP = 2.0, KI = 0.5, KD = 1.0;
+const float MAX_INTEGRAL = 50.0;
+const float ERROR_DEADZONE = 1.0;
+float rollErrorSum = 0, pitchErrorSum = 0, yawErrorSum = 0;
+float lastRollError = 0, lastPitchError = 0, lastYawError = 0;
+
+// Desired angles for stabilization
+const float DESIRED_ROLL = 0.0;
+const float DESIRED_PITCH = 0.0;
+const float DESIRED_YAW = 0.0;
+
+// Servo neutral positions
+const int NEUTRAL_FRONT_BASE = 390;
+const int NEUTRAL_FRONT_TILT = 550;
+const int NEUTRAL_BACK_BASE = 420;
+const int NEUTRAL_BACK_TILT = 580;
+
+// ESC objects
+Servo escLeft;
+Servo escRight;
+
+// Throttle range
+const int THROTTLE_MIN = 1000;
+const int THROTTLE_MAX = 2000;
+
+// Variables for RC inputs
+long RCValueBase, RCValueTilt, RCValueThrottle, RCValueYaw;
+
+void setup() {
+    Serial.begin(9600);
+    pwm.begin();
+    pwm.setPWMFreq(60);
+
+    // Initialize servos to neutral positions
+    pwm.setPWM(FRONT_BASE_CHANNEL, 0, constrain(NEUTRAL_FRONT_BASE, SERVOMIN, SERVOMAX));
+    pwm.setPWM(FRONT_TILT_CHANNEL, 0, constrain(NEUTRAL_FRONT_TILT, SERVOMIN, SERVOMAX));
+    pwm.setPWM(BACK_BASE_CHANNEL, 0, constrain(NEUTRAL_BACK_BASE, SERVOMIN, SERVOMAX));
+    pwm.setPWM(BACK_TILT_CHANNEL, 0, constrain(NEUTRAL_BACK_TILT, SERVOMIN, SERVOMAX));
+    delay(3000);
+    Serial.println("Neutral positions set");
+
+    // Initialize MPU6050
+    Wire.begin();
+    mpu.initialize();
+    delay(20);
+
+    // Initialize ESCs
+    escLeft.attach(ESC_LEFT_PIN);
+    escRight.attach(ESC_RIGHT_PIN);
+    escLeft.writeMicroseconds(THROTTLE_MIN);
+    escRight.writeMicroseconds(THROTTLE_MIN);
+
+    // Set RC pins as input
+    pinMode(RC_PIN_TILT, INPUT);
+    pinMode(RC_PIN_BASE, INPUT);
+    pinMode(RC_PIN_THROTTLE, INPUT);
+    pinMode(RC_PIN_YAW, INPUT);
+}
+
+void loop() {
+    // Read RC inputs
+    RCValueBase = pulseIn(RC_PIN_BASE, HIGH);
+    RCValueTilt = pulseIn(RC_PIN_TILT, HIGH);
+    RCValueThrottle = pulseIn(RC_PIN_THROTTLE, HIGH);
+    RCValueYaw = pulseIn(RC_PIN_YAW, HIGH);
+
+    // Check if RC inputs are active
+    bool rcActive = (RCValueBase > 1000 && RCValueBase < 2000) && 
+                    (RCValueTilt > 1000 && RCValueTilt < 2000) &&
+                    (RCValueThrottle > 1000 && RCValueThrottle < 2000);
+
+    // Read MPU6050 sensor data
+    int16_t ax, ay, az, gx, gy, gz;
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+    float roll = atan2(ay, az) * RAD_TO_DEG;
+    float pitch = atan2(-ax, sqrt(ay * ay + az * az)) * RAD_TO_DEG;
+    float yaw = atan2(gx, gy) * RAD_TO_DEG;
+
+    // PID calculations
+    float rollError = DESIRED_ROLL - roll;
+    float pitchError = DESIRED_PITCH - pitch;
+    float yawError = DESIRED_YAW - yaw;
+
+    // Roll PID
+    rollErrorSum = constrain(rollErrorSum + rollError, -MAX_INTEGRAL, MAX_INTEGRAL);
+    float rollDerivative = rollError - lastRollError;
+    float pidRoll = (KP * rollError) + (KI * rollErrorSum) + (KD * rollDerivative);
+    lastRollError = rollError;
+
+    // Pitch PID
+    pitchErrorSum = constrain(pitchErrorSum + pitchError, -MAX_INTEGRAL, MAX_INTEGRAL);
+    float pitchDerivative = pitchError - lastPitchError;
+    float pidPitch = (KP * pitchError) + (KI * pitchErrorSum) + (KD * pitchDerivative);
+    lastPitchError = pitchError;
+
+    // Yaw PID (for future yaw control)
+    yawErrorSum = constrain(yawErrorSum + yawError, -MAX_INTEGRAL, MAX_INTEGRAL);
+    float yawDerivative = yawError - lastYawError;
+    float pidYaw = (KP * yawError) + (KI * yawErrorSum) + (KD * yawDerivative);
+    lastYawError = yawError;
+
+    // Adjust motor speeds for stabilization
+    int throttle = constrain(map(RCValueThrottle, 1000, 2000, THROTTLE_MIN, THROTTLE_MAX), THROTTLE_MIN, THROTTLE_MAX);
+    int escLeftSpeed = throttle;
+    int escRightSpeed = throttle;
+
+    if (!rcActive) {
+        // Stabilize using MPU6050 without RC input
+        escLeftSpeed -= pidRoll + pidPitch;
+        escRightSpeed += pidRoll - pidPitch;
+    } else {
+        // RC input active, adjust based on user input
+        escLeftSpeed -= map(RCValueYaw, 1000, 2000, -50, 50) + pidPitch;
+        escRightSpeed += map(RCValueYaw, 1000, 2000, -50, 50) - pidPitch;
+    }
+
+    // Constrain motor speeds
+    escLeftSpeed = constrain(escLeftSpeed, THROTTLE_MIN, THROTTLE_MAX);
+    escRightSpeed = constrain(escRightSpeed, THROTTLE_MIN, THROTTLE_MAX);
+
+    // Set motor speeds
+    escLeft.writeMicroseconds(escLeftSpeed);
+    escRight.writeMicroseconds(escRightSpeed);
+
+    // Adjust servos based on RC inputs or stabilization
+    int frontBasePosition = rcActive ? NEUTRAL_FRONT_BASE + map(RCValueBase, 1000, 2000, -150, 150) : NEUTRAL_FRONT_BASE + pidRoll;
+    int backBasePosition = rcActive ? NEUTRAL_BACK_BASE + map(RCValueBase, 1000, 2000, -150, 150) : NEUTRAL_BACK_BASE + pidRoll;
+    int frontTiltPosition = rcActive ? NEUTRAL_FRONT_TILT + map(RCValueTilt, 1000, 2000, -600, 600) : NEUTRAL_FRONT_TILT + pidPitch;
+    int backTiltPosition = rcActive ? NEUTRAL_BACK_TILT + map(RCValueTilt, 1000, 2000, -600, 600) : NEUTRAL_BACK_TILT + pidPitch;
+
+    // Apply constraints to servo positions
+    frontBasePosition = constrain(frontBasePosition, SERVOMIN, SERVOMAX);
+    backBasePosition = constrain(backBasePosition, SERVOMIN, SERVOMAX);
+    frontTiltPosition = constrain(frontTiltPosition, SERVOMIN, SERVOMAX);
+    backTiltPosition = constrain(backTiltPosition, SERVOMIN, SERVOMAX);
+
+    pwm.setPWM(FRONT_BASE_CHANNEL, 0, frontBasePosition);
+    pwm.setPWM(FRONT_TILT_CHANNEL, 0, frontTiltPosition);
+    pwm.setPWM(BACK_BASE_CHANNEL, 0, backBasePosition);
+    pwm.setPWM(BACK_TILT_CHANNEL, 0, backTiltPosition);
+
+    delay(20); // Stabilize loop timing
+}
