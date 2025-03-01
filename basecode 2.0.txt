@@ -1,3 +1,4 @@
+//this code only provide gyro stabilization without rc controll
 #include <Wire.h>
 #include <MPU6050.h>
 #include <Adafruit_PWMServoDriver.h>
