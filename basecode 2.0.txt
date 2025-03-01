@@ -1,199 +1,164 @@
-#include <ESP32Servo.h>
+#include <Wire.h>
 #include <MPU6050.h>
+#include <Adafruit_PWMServoDriver.h>
 
-// Initialize the MPU-6050 object
+// MPU6050 setup
 MPU6050 mpu;
+int16_t ax, ay, az, gx, gy, gz;
 
-// Define the Servo objects for tilting propellers and base
-Servo servobase, servotilt, servobaseb, servotiltb;
-// Define ESC objects for controlling propeller speeds
-Servo esc1, esc2;
+// PCA9685 for servo control
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
 
-// PID gains for roll, pitch, and yaw stabilization
-float kp = 2.0;
-float ki = 0.5;
-float kd = 1.0;
+// Servo definitions
+#define SERVOMIN  150 // Minimum pulse length count (out of 4096)
+#define SERVOMAX  600 // Maximum pulse length count (out of 4096)
 
-// Desired orientation (setpoint) for stabilization
-float desiredRoll = 0.0;
-float desiredPitch = 0.0;
-float desiredYaw = 0.0;
+// Servo Pins on PCA9685
+#define TILT_FRONT_PIN 0
+#define TILT_BACK_PIN 1
+#define PITCH_FRONT_PIN 2
+#define PITCH_BACK_PIN 3
 
-// MPU6050 sensor data variables
-int16_t ax, ay, az;
-int16_t gx, gy, gz;
-float roll, pitch, yaw;
+// Servo neutral positions (in ticks, both props face up)
+const int NEUTRAL_FRONT_BASE = 390;  // Pitch servo (horizontal base)
+const int NEUTRAL_FRONT_TILT = 550;  // Tilt servo (propeller up)
+const int NEUTRAL_BACK_BASE = 420;   // Pitch servo (horizontal base)
+const int NEUTRAL_BACK_TILT = 580;   // Tilt servo (propeller up)
 
-// VTOL mode switch variable
-bool vtolMode = false;
+// PID Constants for stabilization
+float kp_pitch = 4.0, ki_pitch = 0.5, kd_pitch = 0.25; // Pitch
+float kp_roll = 4.0, ki_roll = 0.5, kd_roll = 0.25;   // Roll
+float kp_yaw = 2.0, ki_yaw = 0.2, kd_yaw = 0.1;       // Yaw
 
-// RC (Remote Control) input pins for controlling the UAV
-#define RCPintilt 32  // Pin for the up/down stick
-#define RCPinbase 35  // Pin for the left/right stick
-#define switchc 33    // Switch to toggle between VTOL and normal mode
-#define switchd 25    // Additional switch for custom functions
-#define ch3 34        // Throttle input from receiver
+float pid_pitch = 0, pid_roll = 0, pid_yaw = 0;
+float last_error_pitch = 0, last_error_roll = 0, last_error_yaw = 0;
+float integral_pitch = 0, integral_roll = 0, integral_yaw = 0;
 
-// Servo pin assignments for controlling tilt and base
-int servoPinbase = 13;  // Front base
-int servoPintilt = 14;  // Front tilt
-int servoPinbaseb = 27; // Back base
-int servoPintiltb = 26; // Back tilt
+// Gyro calibration function
+void calibrateGyro() {
+  int32_t gx_sum = 0, gy_sum = 0, gz_sum = 0;
+  const int samples = 100; // Number of samples to average
 
-// ESC pin assignments
-byte esc1pin = 18; // ESC 1 (propeller 1)
-byte esc2pin = 19; // ESC 2 (propeller 2)
+  Serial.println("Calibrating gyro, keep the UAV still...");
+  delay(500); // Brief delay to ensure stability
 
-// RC input range values (adjust based on transmitter/receiver calibration)
-long maxup = 1960, maxmidup = 1550, minmiddown = 1460, mindown = 930;
-long maxleft = 990, maxmidleft = 1460, maxmidright = 1530, maxright = 1940;
+  for (int i = 0; i < samples; i++) {
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+    gx_sum += gx;
+    gy_sum += gy;
+    gz_sum += gz;
+    delay(10); // Sample every 10ms
+  }
 
-// Define variables for storing RC input values
-int throttle = 0, switchdValue = 0, RCValuebase = 0, RCValuetilt = 0, switchcValue = 0;
+  // Calculate average offsets
+  float gx_offset = gx_sum / (float)samples;
+  float gy_offset = gy_sum / (float)samples;
+  float gz_offset = gz_sum / (float)samples;
 
-// PID cumulative error and previous error for derivative calculation
-float cumulativeErrorRoll = 0, cumulativeErrorPitch = 0, cumulativeErrorYaw = 0;
-float previousErrorRoll = 0, previousErrorPitch = 0, previousErrorYaw = 0;
+  // Apply offsets to MPU6050 (divided by 4 due to internal scaling in MPU6050 library)
+  mpu.setXGyroOffset(gx_offset / 4);
+  mpu.setYGyroOffset(gy_offset / 4);
+  mpu.setZGyroOffset(gz_offset / 4);
+
+  Serial.print("Gyro offsets - X: "); Serial.print(gx_offset);
+  Serial.print(" Y: "); Serial.print(gy_offset);
+  Serial.print(" Z: "); Serial.println(gz_offset);
+  Serial.println("Calibration complete.");
+}
 
 void setup() {
-  // Initialize serial communication for debugging
-  Serial.begin(9600);
+  Serial.begin(115200);
+  Wire.begin();
 
-  // Initialize the MPU-6050 sensor
+  // Initialize MPU6050
   mpu.initialize();
+  if (!mpu.testConnection()) {
+    Serial.println("MPU6050 connection failed");
+    while (1);
+  }
 
-  // Attach servos and ESCs to their respective pins
-  servobase.attach(servoPinbase);
-  servotilt.attach(servoPintilt);
-  servobaseb.attach(servoPinbaseb);
-  servotiltb.attach(servoPintiltb);
-  esc1.attach(esc1pin);
-  esc2.attach(esc2pin);
+  // Calibrate gyro
+  calibrateGyro();
 
-  // Initialize the ESCs to a safe state (idle throttle)
-  esc1.writeMicroseconds(1300);
-  esc2.writeMicroseconds(1300);
-  delay(7000); // Allow time for the ESCs to calibrate
+  // Initialize PCA9685
+  pwm.begin();
+  pwm.setPWMFreq(50);  // Analog servos run at ~50 Hz updates
 
-  // Configure the RC input pins
-  pinMode(ch3, INPUT);
-  pinMode(switchd, INPUT);
-  pinMode(RCPintilt, INPUT);
-  pinMode(RCPinbase, INPUT);
-  pinMode(switchc, INPUT);
+  // Set servos to neutral positions (both props up)
+  pwm.setPWM(PITCH_FRONT_PIN, 0, NEUTRAL_FRONT_BASE); // Front pitch servo to horizontal
+  pwm.setPWM(TILT_FRONT_PIN, 0, NEUTRAL_FRONT_TILT);  // Front tilt servo to prop up
+  pwm.setPWM(PITCH_BACK_PIN, 0, NEUTRAL_BACK_BASE);   // Back pitch servo to horizontal
+  pwm.setPWM(TILT_BACK_PIN, 0, NEUTRAL_BACK_TILT);    // Back tilt servo to prop up
+
+  delay(1000); // Allow time for servos to reach neutral positions
 }
 
 void loop() {
-  // Read RC input values (throttle, switch, and joystick)
-  throttle = pulseIn(ch3, HIGH);
-  switchdValue = pulseIn(switchd, HIGH);
-  RCValuebase = pulseIn(RCPinbase, HIGH);
-  RCValuetilt = pulseIn(RCPintilt, HIGH);
-  switchcValue = pulseIn(switchc, HIGH);
-
-  // Read the MPU-6050 sensor data for roll, pitch, and yaw calculations
+  // Read MPU6050 data
   mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
-  roll = atan2(ay, az) * 180 / PI;
-  pitch = atan2(ax, az) * 180 / PI;
-  yaw = atan2(gy, gx) * 180 / PI;
+  
+  // Calculate pitch and roll angles from accelerometer data
+  float pitch = atan2(ax, sqrt(ay * ay + az * az)) * 180 / M_PI;
+  float roll = atan2(ay, sqrt(ax * ax + az * az)) * 180 / M_PI;
+  
+  // Calculate yaw rate from gyroscope (degrees per second)
+  float yaw_rate = gz / 131.0; // MPU6050 default sensitivity: 131 LSB/(deg/s)
 
-  // Calculate errors between desired and actual orientation
-  float errorRoll = desiredRoll - roll;
-  float errorPitch = desiredPitch - pitch;
-  float errorYaw = desiredYaw - yaw;
+  // PID Calculations for stabilization (target is 0 degrees for pitch/roll, 0 deg/s for yaw)
+  float error_pitch = 0 - pitch;
+  float error_roll = 0 - roll;
+  float error_yaw = 0 - yaw_rate;
 
-  // Accumulate the integral of errors for the PID controller
-  cumulativeErrorRoll += errorRoll;
-  cumulativeErrorPitch += errorPitch;
-  cumulativeErrorYaw += errorYaw;
+  integral_pitch += error_pitch;
+  integral_roll += error_roll;
+  integral_yaw += error_yaw;
+  
+  float derivative_pitch = error_pitch - last_error_pitch;
+  float derivative_roll = error_roll - last_error_roll;
+  float derivative_yaw = error_yaw - last_error_yaw;
 
-  // PID calculation for roll, pitch, and yaw control
-  float pidRoll = kp * errorRoll + ki * cumulativeErrorRoll + kd * (errorRoll - previousErrorRoll);
-  float pidPitch = kp * errorPitch + ki * cumulativeErrorPitch + kd * (errorPitch - previousErrorPitch);
-  float pidYaw = kp * errorYaw + ki * cumulativeErrorYaw + kd * (errorYaw - previousErrorYaw);
+  pid_pitch = kp_pitch * error_pitch + ki_pitch * integral_pitch + kd_pitch * derivative_pitch;
+  pid_roll = kp_roll * error_roll + ki_roll * integral_roll + kd_roll * derivative_roll;
+  pid_yaw = kp_yaw * error_yaw + ki_yaw * integral_yaw + kd_yaw * derivative_yaw;
 
-  // Store current error values for the next iteration's derivative calculation
-  previousErrorRoll = errorRoll;
-  previousErrorPitch = errorPitch;
-  previousErrorYaw = errorYaw;
+  last_error_pitch = error_pitch;
+  last_error_roll = error_roll;
+  last_error_yaw = error_yaw;
 
-  // Update the servo positions based on the PID output
-  // Front and back tilt and base adjustment for stabilization
-  servobase.write(60 + pidRoll);        // Adjust front base
-  servotilt.write(80 + pidPitch);       // Adjust front tilt
-  servobaseb.write(180 - pidRoll);      // Adjust back base
-  servotiltb.write(90 - pidPitch);      // Adjust back tilt
+  // Limit PID output
+  pid_pitch = constrain(pid_pitch, -50, 50);
+  pid_roll = constrain(pid_roll, -50, 50);
+  pid_yaw = constrain(pid_yaw, -50, 50);
 
-  // Throttle control (motor speed adjustment) based on the RC input
-  int esc1pwm = map(throttle, 980, 2000, 1000, 1600);
-  int esc2pwm = map(throttle, 980, 2000, 1000, 1600);
-  esc1.writeMicroseconds(esc1pwm);
-  esc2.writeMicroseconds(esc2pwm);
+  // Adjust servos from neutral positions
+  // Tilt servos move together for pitch stabilization
+  int tilt_front = NEUTRAL_FRONT_TILT + map(pid_pitch, -50, 50, -100, 100);
+  int tilt_back = NEUTRAL_BACK_TILT + map(pid_pitch, -50, 50, -100, 100);
 
-  // VTOL mode switch logic
-  if (switchcValue > 1450 && switchcValue < 1530) {
-    vtolMode = true;
-  } else {
-    vtolMode = false;
-  }
+  // Pitch servos combine roll and yaw corrections
+  int pitch_front = NEUTRAL_FRONT_BASE + map(pid_roll + pid_yaw, -100, 100, -100, 100);
+  int pitch_back = NEUTRAL_BACK_BASE - map(pid_roll - pid_yaw, -100, 100, -100, 100);
 
-  // VTOL mode handling
-  if (vtolMode) {
-    // Adjust servos and motors for vertical takeoff and landing (VTOL)
-    if (switchdValue > 1940 && switchdValue < 2100) {
-      esc1pwm = map(throttle, 980, 2000, 1000, 2000);
-      esc2pwm = map(throttle, 980, 2000, 1000, 1500);
-      esc1.writeMicroseconds(esc1pwm);
-      esc2.writeMicroseconds(esc2pwm);
+  // Constrain to valid range
+  tilt_front = constrain(tilt_front, SERVOMIN, SERVOMAX);
+  tilt_back = constrain(tilt_back, SERVOMIN, SERVOMAX);
+  pitch_front = constrain(pitch_front, SERVOMIN, SERVOMAX);
+  pitch_back = constrain(pitch_back, SERVOMIN, SERVOMAX);
 
-      servobase.write(60);   // Set base servos to a neutral position for VTOL
-      servotilt.write(170);  // Tilt motors to provide vertical lift
+  // Apply servo positions using pwm.setPWM
+  pwm.setPWM(TILT_FRONT_PIN, 0, tilt_front);
+  pwm.setPWM(TILT_BACK_PIN, 0, tilt_back);
+  pwm.setPWM(PITCH_FRONT_PIN, 0, pitch_front);
+  pwm.setPWM(PITCH_BACK_PIN, 0, pitch_back);
 
-      // Adjust back servos based on left/right stick input for directional control
-      if (RCValuebase < maxmidleft) {
-        int posleftb = map(RCValuebase, maxmidleft, maxleft, 90, 70);
-        servobaseb.write(posleftb);
-        servotiltb.write(0);
-      } else if (RCValuebase > maxmidright) {
-        int posrightb = map(RCValuebase, maxmidright, maxright, 90, 110);
-        servobaseb.write(posrightb);
-        servotiltb.write(0);
-      } else {
-        servobaseb.write(90);
-        servotiltb.write(0);
-      }
-    }
-  } else {
-    // Normal flight mode handling
-    if (switchdValue > 1940 && switchdValue < 2100) {
-      esc1pwm = map(throttle, 980, 2000, 1000, 1600);
-      esc2pwm = map(throttle, 980, 2000, 1000, 1600);
-      esc1.writeMicroseconds(esc1pwm);
-      esc2.writeMicroseconds(esc2pwm);
+  // Debugging output
+  Serial.print("Pitch: "); Serial.print(pitch);
+  Serial.print(" Roll: "); Serial.print(roll);
+  Serial.print(" Yaw Rate: "); Serial.print(yaw_rate);
+  Serial.print(" Tilt Front: "); Serial.print(tilt_front);
+  Serial.print(" Tilt Back: "); Serial.print(tilt_back);
+  Serial.print(" Pitch Front: "); Serial.print(pitch_front);
+  Serial.print(" Pitch Back: "); Serial.println(pitch_back);
 
-      // Adjust servos based on the tilt (up/down) stick input
-      if (RCValuetilt > maxmidup) {
-        servobase.write(60);
-        int posup = map(RCValuetilt, maxmidup, maxup, 80, 130);
-        servotilt.write(posup);
-        servobaseb.write(180);
-        servotiltb.write(90);
-      } else if (RCValuetilt >= minmiddown && RCValuetilt <= maxmidup) {
-        servobase.write(60);
-        servotilt.write(80);
-        servobaseb.write(180);
-        servotiltb.write(90);
-
-        // Adjust back servos based on left/right stick input
-        if (RCValuebase < maxmidleft) {
-          int posleftb = map(RCValuebase, maxmidleft, maxleft, 90, 130);
-          servotiltb.write(posleftb);
-        } else if (RCValuebase > maxmidright) {
-          int posrightb = map(RCValuebase, maxmidright, maxright, 90, 50);
-          servotiltb.write(posrightb);
-        }
-      }
-    }
-  }
-  delay(50); // Small delay for stability in loop
+  delay(20); // Control loop time (50 Hz)
 }
